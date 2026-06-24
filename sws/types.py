@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, FrozenSet, List, Optional, Set
+from typing import Dict, FrozenSet, List, Optional, Set, Tuple
 
 import torch
 
@@ -12,7 +12,7 @@ ShardId = str
 
 @dataclass(frozen=True)
 class ShardPayload:
-    """Weight tensors loaded from a single on-disk shard."""
+    """Weight tensors loaded from a single on-disk shard (raw clay piece)."""
 
     shard_id: ShardId
     tensors: Dict[str, torch.Tensor]
@@ -24,37 +24,66 @@ class ShardPayload:
 
 
 @dataclass
-class LayerForecast:
+class LayerBlueprint:
+    """Per-layer selection plan from the micro draft model."""
+
     layer_idx: int
     expert_probs: torch.Tensor
     attention_prob: float = 1.0
+    selected_experts: Set[int] = field(default_factory=set)
 
 
 @dataclass
-class Forecast:
-    """Predictor output for the next forward step."""
+class ReassemblyBlueprint:
+    """Micro draft model output: which raw pieces to fetch and how to compose them."""
 
-    layers: List[LayerForecast]
-    high_confidence: Set[ShardId] = field(default_factory=set)
-    low_confidence: Set[ShardId] = field(default_factory=set)
-    expert_shard_ids: Dict[tuple[int, int], ShardId] = field(default_factory=dict)
+    layers: List[LayerBlueprint]
+    high_priority_pieces: Set[ShardId] = field(default_factory=set)
+    low_priority_pieces: Set[ShardId] = field(default_factory=set)
+    expert_shard_ids: Dict[Tuple[int, int], ShardId] = field(default_factory=dict)
     attention_shard_ids: Dict[int, ShardId] = field(default_factory=dict)
 
+    @property
+    def high_confidence(self) -> Set[ShardId]:
+        return self.high_priority_pieces
+
+    @property
+    def low_confidence(self) -> Set[ShardId]:
+        return self.low_priority_pieces
+
     def priority(self, shard_id: ShardId) -> float:
-        for layer_fc in self.layers:
-            for e_idx, prob in enumerate(layer_fc.expert_probs.tolist()):
-                sid = self.expert_shard_ids.get((layer_fc.layer_idx, e_idx))
+        for layer_bp in self.layers:
+            for e_idx, prob in enumerate(layer_bp.expert_probs.tolist()):
+                sid = self.expert_shard_ids.get((layer_bp.layer_idx, e_idx))
                 if sid == shard_id:
                     return float(prob)
-            attn_sid = self.attention_shard_ids.get(layer_fc.layer_idx)
+            attn_sid = self.attention_shard_ids.get(layer_bp.layer_idx)
             if attn_sid == shard_id:
-                return layer_fc.attention_prob
+                return layer_bp.attention_prob
         return 0.0
+
+    def all_pieces(self) -> Set[ShardId]:
+        return self.high_priority_pieces | self.low_priority_pieces
+
+
+# Backward-compatible alias
+LayerForecast = LayerBlueprint
+Forecast = ReassemblyBlueprint
+
+
+@dataclass
+class AssembledSubgraph:
+    """Executable sub-model instance materialized from selected weight pieces."""
+
+    piece_ids: Set[ShardId] = field(default_factory=set)
+    byte_size: int = 0
+    is_exact: bool = True
+    step_id: int = 0
 
 
 @dataclass
 class RealPath:
-    """Actual activation footprint captured from router hooks."""
+    """Actual activation footprint captured from router hooks (reference giant)."""
 
     fired_experts: Dict[int, Set[int]] = field(default_factory=dict)
     used_attention: Set[int] = field(default_factory=set)
@@ -81,3 +110,4 @@ class StepMetrics:
     verifier_rejects: int = 0
     stalls_ms: float = 0.0
     used_approx: int = 0
+    reassembly_count: int = 0

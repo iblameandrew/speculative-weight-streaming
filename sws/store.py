@@ -6,7 +6,7 @@ import json
 import threading
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Iterable, List, Optional, Set
 
 import torch
 from safetensors import safe_open
@@ -92,6 +92,20 @@ class NVMeWeightStore:
             return self._payload_from_file(shard_id, path, is_approx=False)
 
         return self._executor.submit(_work)
+
+    def extract_pieces(
+        self,
+        selection: Iterable[ShardId],
+        exact: bool = True,
+    ) -> List[ShardPayload]:
+        """Return selected raw weight pieces for dynamic reassembly."""
+        payloads: List[ShardPayload] = []
+        for shard_id in selection:
+            if exact:
+                payloads.append(self.load_sync(shard_id))
+            else:
+                payloads.append(self.reconstruct_approx(shard_id))
+        return payloads
 
     def reconstruct_approx(self, shard_id: ShardId) -> ShardPayload:
         """Cheap draft weight stand-in (int8-quantized offline)."""

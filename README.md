@@ -6,51 +6,53 @@
 
 **Streaming a Giant Into a Small Room: A Mechanism for Running Massive LLMs in 32GB RAM**
 
-**SWS** (Speculative Weight Streaming) is a novel technique inspired by speculative decoding that enables running extremely large language models (far exceeding available RAM) on modest hardware by treating RAM as a predictive cache rather than a fixed container.
+**SWS** (Speculative Weight Streaming) is a dynamic model-recomposition system for running frontier-scale MoE models (700B+ parameters) on severely memory-constrained hardware (e.g., 32 GB RAM). A permanently-resident **micro draft model** acts as an intelligent sculptor: it selects raw weight pieces from NVMe storage and reorganizes them into a compact, fully executable sub-model that fits in RAM.
 
 ## Overview
 
-Modern frontier models, particularly Mixture-of-Experts (MoE) architectures, are sparse: only a small fraction of parameters are active for any given token. Traditional loading assumes the entire model must reside in memory, creating an artificial ceiling.
+A giant MoE model such as GLM 5.2 is never loaded whole. Instead, fine-grained weight shards (per-expert FFN, per-layer attention) live on NVMe as **raw clay**. A micro draft model examines the current hidden state and token history, predicts which pieces the next forward pass needs, and emits a **reassembly blueprint**. A dynamic assembler materializes those pieces into an executable subgraph; a strict verifier guarantees output equivalence to the reference giant.
 
-SWS reframes this problem by speculatively streaming and caching only the weights predicted to be needed, with a verify-and-correct mechanism to ensure correctness. The full model lives on fast storage (NVMe), while RAM (e.g., 32GB) holds a dynamic working set.
-
-This approach draws directly from speculative decoding's draft-verify-fallback loop, but applied to model weights instead of tokens.
+This lifts speculative decoding's draft → verify → fallback loop from the token domain into **weight selection and model reassembly**.
 
 ## Core Insight
 
-> You don't fit the model into memory — you fit a good guess about the model into memory, and let a cheap verifier keep that guess honest.
+> The giant model is never instantiated in RAM. A micro draft model selects the raw clay, reorganizes it into a temporary executable instance, and a verifier keeps that assembly honest.
 
 ## Architecture
 
-SWS consists of four cooperating components:
+Four cooperating components:
 
-### 1. The Predictor (Draft Stage)
-- A small, always-resident model (hundreds of MB) that forecasts the activation footprint for upcoming forward passes.
-- Predicts active layers, experts (in MoE), attention heads, and FFN blocks based on current hidden states and token history.
-- Learns online from realized paths to improve over time.
+### 1. NVMeWeightStore (repository of raw clay)
+- Fine-grained `safetensors` shards: per-expert FFN, per-layer attention, routers.
+- `fetch(shard_id)` — async exact retrieval; `extract_pieces(selection)` — batch extraction for reassembly.
+- Lazy mmap; the full giant is never materialized.
 
-### 2. The Materializer (Prefetch & Approximate)
-- Prefetches high-confidence weight shards from disk asynchronously.
-- For low-confidence or rare blocks, reconstructs cheap approximations (e.g., low-rank or heavily quantized stand-ins).
+### 2. MicroDraftModel (intelligent selector & sculptor)
+- Compact permanently-resident network (hundreds of MB) that outputs a **reassembly blueprint**: which experts/layers to activate, with confidence scores.
+- Produces `high_priority_pieces` (exact fetch + immediate assembly) and `low_priority_pieces` (approximated stand-ins).
+- Learns to anticipate router decisions; adapts online from `(blueprint, realized_path)` pairs.
 
-### 3. The Verifier (Safety Net)
-- Checks if speculatively loaded weights matched the actual computation path.
-- On hit: Proceed seamlessly.
-- On miss: Fetch exact weights, recompute the layer, and update the cache.
+### 3. DynamicAssembler + PredictiveCache (reassembly engine)
+- Takes the blueprint, fetches selected pieces, and assembles an executable `nn.Module` subgraph in RAM.
+- Enforces a strict byte budget (default 32 GB); prediction-driven eviction of lowest-future-utility pieces.
+- Hot-pins frequently reused infrastructure (lower layers, routers, attention).
 
-### 4. The Eviction Policy (Cache Management)
-- Maintains the working set within the RAM budget using prediction-driven priorities.
-- Pins frequently used components (e.g., lower layers, hot experts); evicts low-probability shards.
+### 4. Verifier + Reassembly Loop (safety & correctness)
+- Executes the assembled sub-model; captures the true activation path from the reference router.
+- On mismatch: `fallback_reassemble` — fetch additional exact pieces, rebuild, recompute.
+- Guarantees functional equivalence (within tolerance) at the output boundary.
 
 ## Why It Excels for MoE Models (e.g., GLM 5.2)
 
-MoE models activate only a handful of experts per token. SWS exploits this sparsity by predicting router behavior one step ahead, keeping the active plus speculative buffer well within 32GB.
+MoE models activate only a handful of experts per token. The micro draft model exploits this sparsity by selecting and composing the minimal piece set, keeping the reassembled subgraph well within 32 GB even when the full model has 700B+ parameters on disk.
 
 ## Performance Economics
 
-Success depends on predictor accuracy, model sparsity, and storage I/O bandwidth.
+```
+(selection_accuracy × bandwidth_saved) > (miss/reassembly_rate × (recompute + fetch_penalty))
+```
 
-The governing principle is that the benefit from accurate predictions and saved bandwidth must outweigh the cost of occasional misses, which involve recomputation and disk fetches. Weight misses are more expensive than analogous token rejections in speculative decoding due to slower storage access, making high predictor accuracy essential.
+Weight selection misses are far more costly than token rejections in speculative decoding (NVMe ≪ RAM bandwidth). High micro-model forecasting accuracy is essential.
 
 ## Limitations & Caveats
 
@@ -84,7 +86,7 @@ Or individually:
 ```bash
 python benchmarks/phase0_gate.py   # sharding + lazy store
 python benchmarks/phase1_gate.py   # LRU cache + on-demand
-python benchmarks/phase2_gate.py   # predictor + prefetch
+python benchmarks/phase2_gate.py   # micro draft model + prefetch
 python benchmarks/phase3_gate.py   # approximation + verifier
 python benchmarks/phase4_gate.py   # online adaptation + eviction
 ```
@@ -93,10 +95,13 @@ python benchmarks/phase4_gate.py   # online adaptation + eviction
 
 ```
 sws/
-  store.py          # NVMeWeightStore — safetensors shards, async fetch, approx reconstructions
-  cache.py          # PredictiveCache — byte-budget working set, prediction-driven eviction
-  predictor.py      # TinyFootprintPredictor — forecasts next-step expert activation
-  streamer.py       # SpeculativeWeightStreamer — draft → materialize → verify → adapt loop
+  store.py          # NVMeWeightStore — raw clay repository, fetch, extract_pieces
+  micro_draft.py    # MicroDraftModel — selector + reassembly blueprint planner
+  assembler.py      # DynamicAssembler — materialize executable subgraph from blueprint
+  cache.py          # PredictiveCache — byte-budget enforcer inside assembler
+  verifier.py       # Verifier — detect_miss, functional equivalence check
+  streamer.py       # SpeculativeWeightStreamer — select → reassemble → verify → adapt
+  predictor.py      # Backward-compat alias for MicroDraftModel
   hf_integration.py # Hugging Face MoE sharding + lazy linear proxies
 benchmarks/         # phase gates + metrics (RSS, miss rate, stalls, tokens/sec, fidelity)
 tests/              # unit tests
@@ -124,7 +129,7 @@ SWS only wins for **genuinely sparse MoE** models where a small fraction of expe
 ### Roadmap
 - CUDA stream prefetch overlapping attention compute
 - vLLM / llama.cpp integration
-- Stronger predictor architectures (router distillation)
+- Stronger micro draft architectures (router distillation)
 - int4/int2 reconstruction quality tuning
 - Distributed multi-GPU shard placement
 

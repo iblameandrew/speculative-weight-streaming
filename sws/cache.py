@@ -10,7 +10,10 @@ from typing import Dict, Iterable, Optional, Set
 
 import torch
 
-from sws.types import Forecast, ShardId, ShardPayload
+from sws.types import ReassemblyBlueprint, ShardId, ShardPayload
+
+# Backward-compatible alias
+Forecast = ReassemblyBlueprint
 
 
 @dataclass
@@ -69,7 +72,7 @@ class PredictiveCache:
         if entry is not None:
             self._resident_bytes -= self._entry_bytes(entry)
 
-    def _ensure_budget(self, incoming_bytes: int, forecast: Optional[Forecast] = None) -> None:
+    def _ensure_budget(self, incoming_bytes: int, forecast: Optional[ReassemblyBlueprint] = None) -> None:
         while self._resident_bytes + incoming_bytes > self.ram_budget_bytes and self._entries:
             if forecast is not None:
                 evict_id = self._lowest_priority_shard(forecast)
@@ -87,7 +90,7 @@ class PredictiveCache:
             return shard_id
         return None
 
-    def _lowest_priority_shard(self, forecast: Forecast) -> Optional[ShardId]:
+    def _lowest_priority_shard(self, forecast: ReassemblyBlueprint) -> Optional[ShardId]:
         candidates = [
             (forecast.priority(sid), sid)
             for sid, entry in self._entries.items()
@@ -156,7 +159,7 @@ class PredictiveCache:
         self._stats["misses"] += 1
         return None
 
-    def load_exact(self, payloads: Iterable[ShardPayload], forecast: Optional[Forecast] = None) -> None:
+    def load_exact(self, payloads: Iterable[ShardPayload], forecast: Optional[ReassemblyBlueprint] = None) -> None:
         """Synchronous exact load after verifier rejection (stall)."""
         self._stats["stalls"] += 1
         for payload in payloads:
@@ -164,7 +167,7 @@ class PredictiveCache:
             self._ensure_budget(payload.byte_size, forecast=forecast)
             self.put(payload, priority=priority, is_exact=True)
 
-    def evict_lowest_priority(self, forecast: Forecast, count: int = 1) -> None:
+    def evict_lowest_priority(self, forecast: ReassemblyBlueprint, count: int = 1) -> None:
         for _ in range(count):
             evict_id = self._lowest_priority_shard(forecast)
             if evict_id is None:
@@ -172,7 +175,7 @@ class PredictiveCache:
             self._remove(evict_id)
             self._stats["evictions"] += 1
 
-    def trim_to_budget(self, forecast: Optional[Forecast] = None) -> int:
+    def trim_to_budget(self, forecast: Optional[ReassemblyBlueprint] = None) -> int:
         """Evict unpinned shards until within budget; returns eviction count."""
         evicted = 0
         while self._resident_bytes > self.ram_budget_bytes and self._entries:

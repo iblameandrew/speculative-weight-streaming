@@ -1,23 +1,27 @@
-"""Speculative Weight Streamer — draft, materialize, verify, adapt loop."""
+"""Speculative Weight Streamer — select, reassemble, verify, adapt loop."""
 
 from __future__ import annotations
 
 import time
-from typing import Dict, List, Optional, Tuple
-
-# Optional already imported
+from typing import List, Optional, Tuple
 
 import torch
 
-from sws.cache import PredictiveCache
-from sws.lazy_model import LazyMoERunner
-from sws.predictor import TinyFootprintPredictor
+from sws.assembler import DynamicAssembler
+from sws.micro_draft import MicroDraftModel
 from sws.store import NVMeWeightStore
 from sws.synthetic_moe import SyntheticMoEConfig
-from sws.types import Forecast, RealPath, ShardId, StepMetrics
+from sws.types import RealPath, ReassemblyBlueprint, ShardId, StepMetrics
+from sws.verifier import Verifier
 
 
 class SpeculativeWeightStreamer:
+    """
+    Dynamic model-recomposition system. The micro draft model selects raw clay
+    pieces from NVMe; the assembler materializes an executable subgraph; the
+    verifier guarantees equivalence to the reference giant.
+    """
+
     def __init__(
         self,
         cfg: SyntheticMoEConfig,
@@ -25,6 +29,7 @@ class SpeculativeWeightStreamer:
         ram_budget_mb: int = 32_000,
         confidence_threshold: float = 0.15,
         use_predictor: bool = True,
+        use_micro_draft: Optional[bool] = None,
         use_approx: bool = False,
         prediction_eviction: bool = False,
         pin_lower_layers: bool = False,
@@ -33,10 +38,10 @@ class SpeculativeWeightStreamer:
         self.cfg = cfg
         self.store = store
         self.device = torch.device(device)
-        self.cache = PredictiveCache(ram_budget_mb, pin_lower_layers=pin_lower_layers)
-        self.predictor = TinyFootprintPredictor(cfg, confidence_threshold, device=device)
-        self.runner = LazyMoERunner(cfg, self.cache)
-        self.use_predictor = use_predictor
+        self.assembler = DynamicAssembler(cfg, ram_budget_mb, pin_lower_layers=pin_lower_layers)
+        self.micro_draft = MicroDraftModel(cfg, confidence_threshold, device=device)
+        self.verifier = Verifier()
+        self.use_micro_draft = use_micro_draft if use_micro_draft is not None else use_predictor
         self.use_approx = use_approx
         self.prediction_eviction = prediction_eviction
         self._history: List[int] = []
@@ -44,61 +49,24 @@ class SpeculativeWeightStreamer:
         self._trace_buffer: List[Tuple[torch.Tensor, RealPath]] = []
 
         if pin_lower_layers:
-            self.cache.pin_lower_layer_shards(layer_threshold=1)
+            self.assembler.pin_lower_layer_shards(layer_threshold=1)
 
-    def _materialize_baseline(self, input_ids: torch.Tensor) -> Forecast:
-        """Phase 1: resident infrastructure shards; experts loaded on demand."""
-        from sws.sharding import attention_shard_id, layer_norm_shard_id, router_shard_id
+    # Backward-compatible aliases
+    @property
+    def cache(self):
+        return self.assembler.cache
 
-        essential: set[ShardId] = {"embed_weight", "final_norm_weight", "lm_head_weight"}
-        for layer in range(self.cfg.num_layers):
-            essential.add(layer_norm_shard_id(layer))
-            essential.add(attention_shard_id(layer))
-            essential.add(router_shard_id(layer))
-        forecast = Forecast(layers=[], high_confidence=essential, low_confidence=set())
-        for shard_id in essential:
-            if self.cache.get(shard_id) is None:
-                self.cache.load_exact([self.store.load_sync(shard_id)])
-        return forecast
+    @property
+    def predictor(self):
+        return self.micro_draft
 
-    def _materialize_predicted(self, forecast: Forecast) -> None:
-        futures = []
-        for shard in forecast.high_confidence:
-            if self.cache.get(shard) is None:
-                fut = self.store.fetch(shard)
-                self.cache.prefetch_shard(fut, shard, priority=forecast.priority(shard))
-                futures.append((shard, fut))
-        for shard in forecast.low_confidence:
-            if self.cache.get(shard) is None:
-                if self.use_approx:
-                    self.cache.put(
-                        self.store.reconstruct_approx(shard),
-                        priority=forecast.priority(shard),
-                        is_exact=False,
-                    )
-                else:
-                    fut = self.store.fetch(shard)
-                    self.cache.prefetch_shard(fut, shard, priority=forecast.priority(shard))
-                    futures.append((shard, fut))
+    @property
+    def use_predictor(self) -> bool:
+        return self.use_micro_draft
 
-        for shard, fut in futures:
-            if self.cache.get(shard) is None:
-                try:
-                    self.cache.put(fut.result(), priority=forecast.priority(shard), is_exact=True)
-                except Exception:
-                    self.cache.load_exact([self.store.load_sync(shard)], forecast=forecast)
-
-    def _ensure_resident(self, shard_ids: set[ShardId], forecast: Optional[Forecast] = None) -> List[ShardId]:
-        miss = [sid for sid in shard_ids if self.cache.get(sid) is None]
-        if miss:
-            payloads = []
-            for sid in miss:
-                if forecast and sid in forecast.low_confidence and self.use_approx:
-                    payloads.append(self.store.reconstruct_approx(sid))
-                else:
-                    payloads.append(self.store.load_sync(sid))
-            self.cache.load_exact(payloads, forecast=forecast)
-        return miss
+    @use_predictor.setter
+    def use_predictor(self, value: bool) -> None:
+        self.use_micro_draft = value
 
     def forward_step(
         self,
@@ -114,72 +82,34 @@ class SpeculativeWeightStreamer:
         elif input_ids.numel() > 0:
             self._history.extend(input_ids.view(-1).tolist())
 
-        if self.use_predictor:
-            forecast = self.predictor(hidden, self._history)
-            self._materialize_predicted(forecast)
+        if self.use_micro_draft:
+            blueprint = self.micro_draft.select_and_plan(hidden, self._history)
+            self.assembler.assemble_from_blueprint(blueprint, self.store, use_approx=self.use_approx)
         else:
-            forecast = self._materialize_baseline(input_ids)
+            blueprint = self.assembler.assemble_essential(self.store)
 
-        out: Optional[torch.Tensor] = None
-        real_path: Optional[RealPath] = None
         stall_start = time.perf_counter()
-        pinned_this_step: list[ShardId] = []
-
-        def _is_infrastructure(sid: ShardId) -> bool:
-            return (
-                "attention" in sid
-                or "norm" in sid
-                or "router" in sid
-                or sid in {"embed_weight", "final_norm_weight", "lm_head_weight"}
-            )
-
-        for shard in forecast.high_confidence:
-            if _is_infrastructure(shard) and shard in self.cache.resident_set():
-                self.cache.pin_shard(shard, pinned=True)
-                pinned_this_step.append(shard)
-        try:
-            for _ in range(32):
-                self.runner.last_misses = set()
-                try:
-                    out, real_path = self.runner.forward(input_ids)
-                    break
-                except KeyError:
-                    miss = set(self.runner.last_misses) - self.cache.resident_set()
-                    if not miss:
-                        raise
-                    metrics.verifier_rejects += 1
-                    self._ensure_resident(miss, forecast=forecast)
-        finally:
-            for sid in pinned_this_step:
-                if sid in self.cache.resident_set():
-                    self.cache.pin_shard(sid, pinned=False)
-            self.cache.trim_to_budget(forecast)
+        out, real_path, rejects = self.assembler.execute_with_resilience(
+            input_ids, self.store, blueprint,
+        )
+        metrics.verifier_rejects += rejects
+        metrics.reassembly_count = 1
         metrics.stalls_ms += (time.perf_counter() - stall_start) * 1000
 
-        if out is None or real_path is None:
-            raise RuntimeError("Verifier fallback failed to obtain a valid forward pass")
-
-        needed = self.runner.required_shards_for_path(real_path)
-        resident = self.cache.resident_set()
-        post_miss = set(needed) - resident
-        for sid in needed:
-            entry = self.cache._entries.get(sid)
-            if entry is not None and not entry.is_exact:
-                post_miss.add(sid)
-        if post_miss:
+        miss = self.verifier.detect_miss(real_path, self.cache, self.assembler.runner, blueprint)
+        if not self.verifier.accepts(miss):
             metrics.verifier_rejects += 1
-            self._ensure_resident(post_miss, forecast=forecast)
-            out, real_path = self.runner.forward(input_ids)
+            metrics.reassembly_count += 1
+            self.assembler.fallback_reassemble(miss, blueprint, self.store)
+            out, real_path = self.assembler.execute_assembled(input_ids)
         else:
             metrics.verifier_accepts += 1
 
-        if real_path is not None:
-            self._trace_buffer.append((hidden.detach().cpu(), real_path))
-        if self.use_predictor and real_path is not None:
-            loss = self.predictor.update(forecast, real_path, hidden=hidden)
-            _ = loss
+        self._trace_buffer.append((hidden.detach().cpu(), real_path))
+        if self.use_micro_draft:
+            self.micro_draft.adapt(blueprint, real_path, hidden=hidden)
 
-        self.cache.assert_within_budget()
+        self.assembler.assert_within_budget()
         metrics.prefetch_hits = self.cache.stats["hits"]
         metrics.prefetch_misses = self.cache.stats["misses"]
         self._step_metrics.append(metrics)
@@ -221,6 +151,7 @@ class SpeculativeWeightStreamer:
             "evictions": self.cache.stats["evictions"],
             "peak_ram_mb": self.cache.peak_bytes / (1024 * 1024),
             "stalls": self.cache.stats["stalls"],
+            "reassembly_count": sum(m.reassembly_count for m in self._step_metrics),
         }
 
     def collect_traces(self) -> List[Tuple[torch.Tensor, RealPath]]:
