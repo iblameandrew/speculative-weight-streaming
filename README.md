@@ -6,7 +6,7 @@
 
 **Streaming a Giant Into a Small Room: A Mechanism for Running Massive LLMs in 32GB RAM**
 
-Gravastar implements **Speculative Weight Streaming (SWS)** — a novel technique inspired by speculative decoding that enables running extremely large language models (far exceeding available RAM) on modest hardware by treating RAM as a predictive cache rather than a fixed container.
+**SWS** (Speculative Weight Streaming) is a novel technique inspired by speculative decoding that enables running extremely large language models (far exceeding available RAM) on modest hardware by treating RAM as a predictive cache rather than a fixed container.
 
 ## Overview
 
@@ -61,20 +61,72 @@ The governing principle is that the benefit from accurate predictions and saved 
 
 ## Getting Started
 
-This repository serves as a conceptual framework and proof-of-concept. Implementation details will evolve with development.
-
 ### Prerequisites
-- Python 3.10 or higher
-- PyTorch or a compatible inference engine
-- Fast NVMe SSD
-- Sufficient host memory (32GB or more recommended)
+- Python 3.10+
+- PyTorch, Hugging Face `transformers`, `safetensors`
+- Fast NVMe SSD (any local disk works for the proof-of-concept)
+- `psutil` for RSS benchmarks
+
+```bash
+pip install -r requirements.txt
+```
+
+### Run verification gates
+
+Each phase has an independent gate script. Run all sequentially:
+
+```bash
+python benchmarks/run_all_gates.py
+```
+
+Or individually:
+
+```bash
+python benchmarks/phase0_gate.py   # sharding + lazy store
+python benchmarks/phase1_gate.py   # LRU cache + on-demand
+python benchmarks/phase2_gate.py   # predictor + prefetch
+python benchmarks/phase3_gate.py   # approximation + verifier
+python benchmarks/phase4_gate.py   # online adaptation + eviction
+```
+
+### Package layout
+
+```
+sws/
+  store.py          # NVMeWeightStore — safetensors shards, async fetch, approx reconstructions
+  cache.py          # PredictiveCache — byte-budget working set, prediction-driven eviction
+  predictor.py      # TinyFootprintPredictor — forecasts next-step expert activation
+  streamer.py       # SpeculativeWeightStreamer — draft → materialize → verify → adapt loop
+  hf_integration.py # Hugging Face MoE sharding + lazy linear proxies
+benchmarks/         # phase gates + metrics (RSS, miss rate, stalls, tokens/sec, fidelity)
+tests/              # unit tests
+```
+
+### Synthetic vs real MoE models
+
+Gates run on a **tiny synthetic MoE** (no multi-GB download) to prove correctness on any machine. For real hardware validation, shard a genuine MoE:
+
+```python
+from sws.hf_integration import shard_hf_model, recommended_test_models
+
+shard_hf_model(recommended_test_models()[0], output_dir="shards/")
+```
+
+Recommended open-weight MoE models (smallest first):
+- `trl-internal-testing/tiny-Mixtral-8x7B-Instruct-v0.1` (CI / smoke tests)
+- `Qwen/Qwen1.5-MoE-A2.7B`
+- `mistralai/Mixtral-8x7B-v0.1`
+
+### Honest caveat
+
+SWS only wins for **genuinely sparse MoE** models where a small fraction of experts fire per token. On a dense model where every parameter participates in every forward pass, there is nothing to speculate about — the approach collapses to ordinary on-demand loading with verifier overhead.
 
 ### Roadmap
-- Initial prototype with synthetic MoE models
-- Integration with popular inference backends such as vLLM, Hugging Face, and llama.cpp
-- Advanced predictor architectures
-- Quantization-aware reconstruction methods
-- Distributed multi-GPU variants
+- CUDA stream prefetch overlapping attention compute
+- vLLM / llama.cpp integration
+- Stronger predictor architectures (router distillation)
+- int4/int2 reconstruction quality tuning
+- Distributed multi-GPU shard placement
 
 ## Contributing
 
