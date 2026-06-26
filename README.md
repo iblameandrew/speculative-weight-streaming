@@ -5,7 +5,7 @@
 
 **Streaming a Giant Into a Small Room: Dynamic Model Recomposition for Massive MoE LLMs in 32 GB RAM**
 
-SWS is a system for running frontier-scale Mixture-of-Experts models whose full weight footprint vastly exceeds available RAM — think 700B-parameter giants such as GLM 5.2 on a 32 GB machine. The giant is never loaded whole. A permanently-resident **micro draft model** selects individual weight shards from NVMe, and a **dynamic assembler** reorganizes them into a compact, fully executable sub-model that lives in RAM for one forward pass at a time.
+SWS is a system for running frontier-scale Mixture-of-Experts models whose full weight footprint vastly exceeds available RAM. The primary deployment target is **[Ornith-1.0-397B](https://huggingface.co/deepreinforce-ai/Ornith-1.0-397B)** — a 397B-parameter agentic coding MoE (512 experts/layer, 10 active/token) — on a 32 GB machine. The giant is never loaded whole. A permanently-resident **micro draft model** selects individual weight shards from NVMe, and a **dynamic assembler** reorganizes them into a compact, fully executable sub-model that lives in RAM for one forward pass at a time.
 
 ## Conceptual framing
 
@@ -150,9 +150,33 @@ python -m pytest tests/ -q           # unit tests
 
 Reported metrics per gate: peak RSS, peak cache bytes, miss rate, accept/reject rate, stalls, tokens/sec, output fidelity vs vanilla.
 
+## Primary target: Ornith-1.0-397B
+
+| Giant property | Value |
+|---|---|
+| Model | `deepreinforce-ai/Ornith-1.0-397B` (Qwen3.5-MoE backbone) |
+| Total params | 397B (BF16 on disk) |
+| Layers | 60 |
+| Experts / layer | 512 routed + 1 shared |
+| Active experts / token | 10 |
+| Attention | 3× linear + 1× full (repeating) |
+| Context | 262K tokens |
+
+The **Ornith micro draft model** (`OrnithDraftSelector`) is a hierarchical selector (~150–220M params, ~150–220 MB BF16) that forecasts a `60 × 512` expert activation grid — too large for a flat MLP — using per-layer heads, cross-layer attention, and token-history encoding. Full architecture proposal: [`docs/ornith_draft_architecture.md`](docs/ornith_draft_architecture.md).
+
+```python
+from sws import propose_architecture_summary, OrnithMicroDraftModel, OrnithMoEConfig
+
+print(propose_architecture_summary())
+# → draft_params_m ~180, draft_resident_mb_bf16 ~360, output_space 30720
+
+draft = OrnithMicroDraftModel(OrnithMoEConfig())
+blueprint = draft.select_and_plan(hidden_state, token_history)
+```
+
 ## Why MoE — and why not dense models
 
-MoE models (Mixtral, Qwen MoE, GLM 5.2) activate **k ≪ E** experts per token out of **E** total per layer. The micro draft model exploits router predictability: if it can forecast the active expert set one step ahead, the reassembled subgraph touches ~`k × L` expert shards instead of `E × L`.
+MoE models activate **k ≪ E** experts per token out of **E** total per layer. Ornith's ratio is **10 / 512 ≈ 2%**. The micro draft model exploits router predictability: if it can forecast the active expert set one step ahead, the reassembled subgraph touches ~`k × L` expert shards instead of `E × L`.
 
 On a **dense** model, every parameter fires every step. There is no sparsity to select against — SWS collapses to on-demand loading with verifier overhead and wins nothing. This is an honest structural limitation, not an implementation gap.
 
@@ -205,8 +229,12 @@ sws/
   streamer.py       # SpeculativeWeightStreamer — main loop
   lazy_model.py     # LazyMoERunner — weight proxies for assembled subgraph
   sharding.py       # Per-expert safetensors partitioning + int8 approx shards
-  hf_integration.py # Real HF MoE sharding + LazyLinear proxies
+  ornith_config.py  # Ornith-1.0-397B constants from HF config.json
+  ornith_draft.py   # OrnithDraftSelector + OrnithMicroDraftModel
+  hf_integration.py # Ornith/Qwen3.5 sharding + lazy linear proxies
   synthetic_moe.py  # Tiny MoE for local gates without multi-GB downloads
+docs/
+  ornith_draft_architecture.md  # Full micro draft model design doc
 benchmarks/         # Phase 0–4 gate scripts
 tests/              # Unit tests
 ```
@@ -214,16 +242,21 @@ tests/              # Unit tests
 ### Real MoE validation (beyond synthetic gates)
 
 ```python
-from sws.hf_integration import shard_hf_model, recommended_test_models
+from sws.hf_integration import shard_ornith_model, ORNITH_MODEL_ID, recommended_dev_models
 
-# Smallest genuine MoE with per-expert weight exposure
-shard_hf_model(recommended_test_models()[0], output_dir="shards/")
+# Production target — requires ~800GB disk, transformers >= 5.8.1
+shard_ornith_model(output_dir="shards/ornith-397b/")
+
+# CI / dev (small MoE, no 397B download)
+from sws.hf_integration import shard_hf_model
+shard_hf_model(recommended_dev_models()[0], output_dir="shards/dev/")
 ```
 
-Recommended models (smallest first):
-- `trl-internal-testing/tiny-Mixtral-8x7B-Instruct-v0.1` — CI / smoke tests
-- `Qwen/Qwen1.5-MoE-A2.7B`
-- `mistralai/Mixtral-8x7B-v0.1`
+| Model | Role |
+|---|---|
+| `deepreinforce-ai/Ornith-1.0-397B` | Primary SWS target |
+| `deepreinforce-ai/Ornith-1.0-35B` | Mid-scale Ornith validation |
+| `trl-internal-testing/tiny-Mixtral-8x7B-Instruct-v0.1` | CI gates |
 
 ## Limitations and operational caveats
 
